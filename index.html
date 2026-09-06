@@ -29,10 +29,11 @@
 // ===================== КОНСТАНТЫ =====================
 const PLAYER_Y_RATIO = 0.28;        // лыжник в верхней трети экрана
 const BASE_SPEED = 220;             // начальная скорость трассы, px/сек
-const MAX_SPEED = 560;              // предельная скорость
+const MAX_SPEED = 800;              // предельная скорость
 const SPEED_RAMP = 5.5;             // прирост скорости, px/сек за сек
 const SPAWN_INTERVAL_START = 1.15;  // стартовый интервал спавна, сек
 const SPAWN_INTERVAL_MIN = 0.46;    // минимальный интервал (активен при максимальной сложности)
+const REF_W = 390;                  // эталонная ширина экрана (iPhone) — плотность спавна нормируется к ней
 const BONUS_INTERVAL = 2.2;         // средний интервал бонусов, сек
 const BONUS_SCORE = 50;             // 50 очков за собранный бонус-кружочек
 const SURVIVE_SCORE_PER_SEC = 10;   // 1 очко за каждые 100 мс
@@ -138,15 +139,9 @@ function spawnObstacle() {
   const type = Math.random() < 0.65 ? 'tree' : 'snowman';
   const w = type === 'tree' ? 40 : 44;
   const h = type === 'tree' ? 64 : 56;
-  const lo = BORDER_W + w, hi = G.w - BORDER_W - w;
-  let x = rand(lo, hi);
-  for (let i = 0; i < 3 && Math.abs(x - G.player.x) < 70; i++) {
-    x = rand(lo, hi);
-  }
-  // Детерминированный fallback: если всё ещё в зоне — к дальней от игрока границе
-  if (Math.abs(x - G.player.x) < 70) {
-    x = (G.player.x - lo >= hi - G.player.x) ? lo : hi;
-  }
+  // Позиция равномерно по коридору, включая зону под лыжником:
+  // иначе можно ехать прямо и ни разу не встретить препятствие
+  const x = rand(BORDER_W + w, G.w - BORDER_W - w);
   // Препятствие выезжает из-за нижнего края (камера едет вниз за лыжником)
   G.obstacles.push({ type, x, y: G.h + h / 2 + 10, w, h });
 }
@@ -163,7 +158,7 @@ function resetGame() {
   G.speed = BASE_SPEED;
   G.obstacles.length = 0;
   G.bonuses.length = 0;
-  G.spawnTimer = 0.6;   // короткая пауза перед первым препятствием
+  G.spawnTimer = 0.6 * REF_W / G.w;   // пауза перед первым препятствием (короче на широком экране)
   G.bonusTimer = 1.0;
   G.player.x = G.w / 2;
   G.player.tilt = 0;
@@ -248,12 +243,14 @@ function update(dt) {
   for (const t of G.trail) t.y -= G.speed * dt;
   G.trail = G.trail.filter((t) => G.elapsed - t.born < TRAIL_LIFETIME && t.y > -10);
 
-  // Спавн препятствий: интервал сокращается со временем
+  // Спавн препятствий: интервал сокращается со временем.
+  // Шире экран — больше препятствий: интервал нормирован к эталонной ширине REF_W
   G.spawnTimer -= dt;
   if (G.spawnTimer <= 0) {
     spawnObstacle();
     const d = difficulty();
-    G.spawnTimer = Math.max(SPAWN_INTERVAL_MIN, SPAWN_INTERVAL_START / d) * rand(0.75, 1.25);
+    const base = Math.max(SPAWN_INTERVAL_MIN, SPAWN_INTERVAL_START / d);
+    G.spawnTimer = base * REF_W / G.w * rand(0.75, 1.25);
   }
   // Спавн бонусов
   G.bonusTimer -= dt;
