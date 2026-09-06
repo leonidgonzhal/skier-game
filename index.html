@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<!-- user-scalable=no + maximum-scale=1: запрет жестов зума в Safari -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Лыжник</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    overflow: hidden;                 /* без скролла страницы */
+    overscroll-behavior: none;        /* без pull-to-refresh */
+    background: #dfeefb;
+  }
+  :root { --sat: env(safe-area-inset-top, 0px); } /* отступ под «чёлку» iPhone */
+  canvas {
+    display: block;
+    touch-action: none;               /* свайпы не скроллят и не зумят */
+    -webkit-user-select: none;
+    user-select: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+// ===================== КОНСТАНТЫ =====================
+const PLAYER_Y_RATIO = 0.28;        // лыжник в верхней трети экрана
+const BASE_SPEED = 220;             // начальная скорость трассы, px/сек
+const MAX_SPEED = 560;              // предельная скорость
+const SPEED_RAMP = 5.5;             // прирост скорости, px/сек за сек
+const SPAWN_INTERVAL_START = 1.15;  // стартовый интервал спавна, сек
+const SPAWN_INTERVAL_MIN = 0.46;    // минимальный интервал (активен при максимальной сложности)
+const BONUS_INTERVAL = 2.2;         // средний интервал бонусов, сек
+const BONUS_SCORE = 50;             // 50 очков за собранный бонус-кружочек
+const SURVIVE_SCORE_PER_SEC = 10;   // 1 очко за каждые 100 мс
+const PLAYER_SPEED = 420;           // гориз. скорость лыжника, px/сек
+const TILT_MAX = 0.22;              // наклон при повороте, рад (~13°)
+const BEST_KEY = 'skier_best_v1';
+const BORDER_W = 36;           // ширина полосы ёлок-ограничителей у каждого края
+const BORDER_TREE_SPACING = 52; // вертикальный шаг ёлок в колонне
+
+const COLORS = {
+  sky: '#dfeefb', snowDot: '#c9dcf0',
+  tree: '#2e7d32', treeDark: '#1b5e20', trunk: '#795548', snowCap: '#ffffff',
+  snowman: '#ffffff', snowmanShade: '#dde7f0',
+  stick: '#8d6e63', carrot: '#ff9800',
+  skier: '#1565c0', skierDark: '#0d47a1', skin: '#ffcc80', ski: '#ffb300',
+  bonus: '#ffd54f', bonusDark: '#ffb300',
+  text: '#37474f', danger: '#c62828',
+};
+
+// ===================== ХЕЛПЕРЫ =====================
+function clamp(v, min, max) { return v < min ? min : (v > max ? max : v); }
+function rand(min, max) { return min + Math.random() * (max - min); }
+
+// Верхний safe-area (чёлка iPhone). В браузере без чёлки — 0.
+// typeof-проверка нужна для Node-песочницы (tests/harness.js), где getComputedStyle нет.
+function safeTop() {
+  if (typeof getComputedStyle !== 'function') return 0;
+  return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sat')) || 0;
+}
+
+// ===================== CANVAS =====================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ===================== СОСТОЯНИЕ =====================
+const G = {
+  state: 'menu',        // 'menu' | 'playing' | 'dead'
+  w: 0, h: 0, dpr: 1,
+  score: 0, scoreFloat: 0, best: 0,
+  elapsed: 0,
+  speed: BASE_SPEED,
+  deadAt: 0,
+  player: { x: 0, y: 0, w: 26, h: 32, tilt: 0 },
+  obstacles: [],
+  bonuses: [],
+  flakes: [],
+  spawnTimer: 0, bonusTimer: 0, lastTime: 0,
+  scrollY: 0,  // накопленный путь мира (для скролла колонн ограничителей)
+};
+const input = { left: false, right: false };
+
+// ===================== РЕКОРД =====================
+function loadBest() {
+  try { return parseInt(localStorage.getItem(BEST_KEY), 10) || 0; }
+  catch (e) { return 0; } // приватный режим Safari — localStorage бросает
+}
+function saveBest(v) {
+  try { localStorage.setItem(BEST_KEY, String(v)); }
+  catch (e) { /* приватный режим — рекорд не сохранится, игра работает */ }
+}
+
+// ===================== РАЗМЕР ЭКРАНА =====================
+function resize() {
+  G.dpr = Math.min(window.devicePixelRatio || 1, 3);
+  G.w = window.innerWidth;
+  G.h = window.innerHeight;
+  canvas.width = Math.round(G.w * G.dpr);
+  canvas.height = Math.round(G.h * G.dpr);
+  canvas.style.width = G.w + 'px';
+  canvas.style.height = G.h + 'px';
+  ctx.setTransform(G.dpr, 0, 0, G.dpr, 0, 0); // рисуем в CSS-пикселях
+  G.player.y = G.h * PLAYER_Y_RATIO;
+  G.player.x = clamp(G.player.x || G.w / 2, BORDER_W + G.player.w / 2, G.w - BORDER_W - G.player.w / 2);
+  initFlakes();
+}
+
+// Фоновая текстура снега — статичные светло-серые точки с параллаксом
+function initFlakes() {
+  const count = Math.round((G.w * G.h) / 9000);
+  G.flakes = [];
+  for (let i = 0; i < count; i++) {
+    G.flakes.push({
+      x: Math.random() * G.w,
+      y: Math.random() * G.h,
+      r: rand(1, 2.5),
+      depth: rand(0.25, 0.6), // доля скорости трассы (параллакс)
+    });
+  }
+}
+
+// ===================== СПАВН =====================
+// Плавное усложнение: множитель 1 -> 2.5 за 60 сек (потом кап по MAX_SPEED)
+function difficulty() {
+  return Math.min(MAX_SPEED / BASE_SPEED, 1 + (G.elapsed * SPEED_RAMP) / BASE_SPEED);
+}
+
+function spawnObstacle() {
+  const type = Math.random() < 0.65 ? 'tree' : 'snowman';
+  const w = type === 'tree' ? 40 : 44;
+  const h = type === 'tree' ? 64 : 56;
+  const lo = BORDER_W + w, hi = G.w - BORDER_W - w;
+  let x = rand(lo, hi);
+  for (let i = 0; i < 3 && Math.abs(x - G.player.x) < 70; i++) {
+    x = rand(lo, hi);
+  }
+  // Детерминированный fallback: если всё ещё в зоне — к дальней от игрока границе
+  if (Math.abs(x - G.player.x) < 70) {
+    x = (G.player.x - lo >= hi - G.player.x) ? lo : hi;
+  }
+  // Препятствие выезжает из-за нижнего края (камера едет вниз за лыжником)
+  G.obstacles.push({ type, x, y: G.h + h / 2 + 10, w, h });
+}
+
+function spawnBonus() {
+  G.bonuses.push({ x: rand(BORDER_W + 20, G.w - BORDER_W - 20), y: G.h + 8 + 10, r: 8, phase: Math.random() * Math.PI * 2 });
+}
+
+// ===================== ЖИЗНЕННЫЙ ЦИКЛ =====================
+function resetGame() {
+  G.state = 'playing';
+  G.score = 0; G.scoreFloat = 0;
+  G.elapsed = 0;
+  G.speed = BASE_SPEED;
+  G.obstacles.length = 0;
+  G.bonuses.length = 0;
+  G.spawnTimer = 0.6;   // короткая пауза перед первым препятствием
+  G.bonusTimer = 1.0;
+  G.player.x = G.w / 2;
+  G.player.tilt = 0;
+}
+
+function startGame() {
+  resetGame();
+}
+
+function gameOver() {
+  G.state = 'dead';
+  G.deadAt = performance.now();
+  if (G.score > G.best) { G.best = G.score; saveBest(G.best); }
+}
+
+// ===================== СТОЛКНОВЕНИЯ =====================
+// Хитбоксы меньше визуала — столкновения ощущаются справедливыми
+function playerHitbox() {
+  const p = G.player;
+  return { x: p.x - p.w * 0.32, y: p.y - p.h * 0.38, w: p.w * 0.64, h: p.h * 0.76 };
+}
+function obstacleHitbox(o) {
+  return { x: o.x - o.w * 0.38, y: o.y - o.h * 0.38, w: o.w * 0.76, h: o.h * 0.76 };
+}
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+function checkCollision() {
+  const ph = playerHitbox();
+  for (const o of G.obstacles) {
+    if (rectsOverlap(ph, obstacleHitbox(o))) return true;
+  }
+  return false;
+}
+// Сбор бонусов: +50 очков, бонус удаляется
+function collectBonuses() {
+  const p = G.player;
+  for (let i = G.bonuses.length - 1; i >= 0; i--) {
+    const b = G.bonuses[i];
+    const dx = b.x - p.x, dy = b.y - p.y;
+    if (dx * dx + dy * dy < (b.r + 16) * (b.r + 16)) {
+      G.bonuses.splice(i, 1);
+      G.scoreFloat += BONUS_SCORE;
+      G.score = Math.floor(G.scoreFloat);
+    }
+  }
+}
+
+// ===================== ОБНОВЛЕНИЕ МИРА =====================
+function update(dt) {
+  // Мир скроллится вверх: камера следует за спуском
+  const scroll = G.state === 'playing' ? G.speed : BASE_SPEED * 0.5;
+  G.scrollY += scroll * dt; // накопление во всех состояниях
+  for (const f of G.flakes) {
+    f.y -= scroll * f.depth * dt;
+    if (f.y < -3) { f.y = G.h + 3; f.x = Math.random() * G.w; }
+  }
+
+  if (G.state !== 'playing') return;
+
+  G.elapsed += dt;
+  G.speed = Math.min(MAX_SPEED, BASE_SPEED * difficulty());
+
+  // Очки за выживание: 10 в секунду = 1 за каждые 100 мс
+  G.scoreFloat += SURVIVE_SCORE_PER_SEC * dt;
+  G.score = Math.floor(G.scoreFloat);
+  updatePlayer(dt);
+
+  // Спавн препятствий: интервал сокращается со временем
+  G.spawnTimer -= dt;
+  if (G.spawnTimer <= 0) {
+    spawnObstacle();
+    const d = difficulty();
+    G.spawnTimer = Math.max(SPAWN_INTERVAL_MIN, SPAWN_INTERVAL_START / d) * rand(0.75, 1.25);
+  }
+  // Спавн бонусов
+  G.bonusTimer -= dt;
+  if (G.bonusTimer <= 0) {
+    spawnBonus();
+    G.bonusTimer = BONUS_INTERVAL * rand(0.7, 1.3);
+  }
+
+  // Мир уезжает ВВЕРХ: камера следует за лыжником вниз по склону
+  for (const o of G.obstacles) o.y -= G.speed * dt;
+  for (const b of G.bonuses) b.y -= G.speed * dt;
+  // Удаление уехавших за верхний край
+  G.obstacles = G.obstacles.filter((o) => o.y > -o.h - 10);
+  G.bonuses = G.bonuses.filter((b) => b.y > -b.r - 10);
+
+  collectBonuses();
+  if (checkCollision()) gameOver();
+}
+
+// ===================== ДВИЖЕНИЕ ИГРОКА =====================
+function updatePlayer(dt) {
+  const p = G.player;
+  let dir = 0;
+  if (input.left) dir -= 1;
+  if (input.right) dir += 1;
+  p.x = clamp(p.x + dir * PLAYER_SPEED * dt, BORDER_W + p.w / 2, G.w - BORDER_W - p.w / 2);
+  // Плавный наклон к целевому углу (направление движения или инерция к нулю)
+  const target = dir * TILT_MAX;
+  p.tilt += (target - p.tilt) * Math.min(1, dt * 12);
+}
+
+// ===================== РИСОВАНИЕ =====================
+function drawFlakes() {
+  ctx.fillStyle = COLORS.snowDot;
+  for (const f of G.flakes) {
+    ctx.fillRect(Math.round(f.x), Math.round(f.y), f.r, f.r);
+  }
+}
+
+function circle(x, y, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
+}
+
+// Пиксельная ёлка: зелёные треугольные ярусы + коричневый ствол
+function drawTree(o) {
+  const x = o.x, y = o.y;
+  ctx.fillStyle = COLORS.trunk;
+  ctx.fillRect(x - 4, y + o.h * 0.3, 8, o.h * 0.2); // ствол
+  ctx.fillStyle = COLORS.tree;
+  // Три треугольных яруса
+  for (let i = 0; i < 3; i++) {
+    const tierW = o.w * (0.5 + i * 0.25);
+    const tierTop = y - o.h * 0.5 + i * o.h * 0.28;
+    const tierH = o.h * 0.4;
+    ctx.beginPath();
+    ctx.moveTo(x, tierTop);
+    ctx.lineTo(x - tierW / 2, tierTop + tierH);
+    ctx.lineTo(x + tierW / 2, tierTop + tierH);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.fillStyle = COLORS.snowCap;
+  ctx.fillRect(x - 2, y - o.h * 0.5, 4, 4); // снежная шапка
+}
+
+// Пиксельный снеговик: три снежка, палки-руки, морковка
+function drawSnowman(o) {
+  const x = o.x, y = o.y;
+  circle(x, y + o.h * 0.28, o.w * 0.3, COLORS.snowman, COLORS.snowmanShade); // низ
+  circle(x, y - o.h * 0.02, o.w * 0.23, COLORS.snowman, COLORS.snowmanShade); // середина
+  circle(x, y - o.h * 0.3, o.w * 0.17, COLORS.snowman, COLORS.snowmanShade);  // голова
+  ctx.strokeStyle = COLORS.stick; // руки-палки
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x - o.w * 0.22, y - o.h * 0.05); ctx.lineTo(x - o.w * 0.48, y - o.h * 0.25);
+  ctx.moveTo(x + o.w * 0.22, y - o.h * 0.05); ctx.lineTo(x + o.w * 0.48, y - o.h * 0.25);
+  ctx.stroke();
+  circle(x - 3, y - o.h * 0.34, 1.5, '#37474f'); // глаза
+  circle(x + 3, y - o.h * 0.34, 1.5, '#37474f');
+  ctx.fillStyle = COLORS.carrot; // нос-морковка
+  ctx.fillRect(x - 1, y - o.h * 0.28, 2, 6);
+}
+
+function drawObstacles() {
+  for (const o of G.obstacles) {
+    if (o.type === 'tree') drawTree(o); else drawSnowman(o);
+  }
+}
+
+// Жёлтый снежок-бонус с лёгким покачиванием
+function drawBonuses() {
+  for (const b of G.bonuses) {
+    const wob = Math.sin(b.phase + performance.now() / 300) * 2;
+    circle(b.x + wob, b.y, b.r, COLORS.bonus, COLORS.bonusDark);
+    circle(b.x + wob - 2, b.y - 2, 2, '#fff8e1');
+  }
+}
+
+// Маленькая ёлка-ограничитель: тёмная, ~28×40, стилизована под колонну вдоль края
+function drawBorderTree(x, y) {
+  ctx.fillStyle = COLORS.trunk;
+  ctx.fillRect(x - 3, y + 8, 6, 10); // ствол
+  ctx.fillStyle = COLORS.treeDark;
+  ctx.beginPath();
+  ctx.moveTo(x, y - 20);
+  ctx.lineTo(x - 13, y + 8);
+  ctx.lineTo(x + 13, y + 8);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// Непрерывные вертикальные колонны ёлок вдоль краёв — ограничители трассы.
+// Скроллятся вверх вместе с миром (мир едет вверх, камера — вниз за лыжником).
+function drawBorder() {
+  const total = G.h + BORDER_TREE_SPACING; // период бесшовного заворачивания
+  const rows = Math.ceil(total / BORDER_TREE_SPACING) + 1;
+  for (let i = 0; i < rows; i++) {
+    const y = (((i * BORDER_TREE_SPACING - G.scrollY) % total) + total) % total - BORDER_TREE_SPACING;
+    drawBorderTree(BORDER_W / 2, y);
+    drawBorderTree(G.w - BORDER_W / 2, y);
+  }
+}
+
+// Лыжник, вид сверху/сзади: синяя фигурка, палки, лыжи; наклон при повороте
+function drawPlayer() {
+  const p = G.player;
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(p.tilt);
+  // Лыжник едет ВНИЗ по склону — спрайт перевёрнут: голова внизу, лыжи вверху
+  ctx.scale(1, -1);
+  // Лыжи (жёлтые полоски)
+  ctx.fillStyle = COLORS.ski;
+  ctx.fillRect(-9, -14, 4, 30);
+  ctx.fillRect(5, -14, 4, 30);
+  // Тело
+  ctx.fillStyle = COLORS.skier;
+  ctx.fillRect(-7, -10, 14, 18);
+  // Голова (шапка)
+  ctx.fillStyle = COLORS.skierDark;
+  ctx.fillRect(-5, -18, 10, 8);
+  // Руки и палки
+  ctx.strokeStyle = COLORS.skier;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(-7, -4); ctx.lineTo(-14, -12);
+  ctx.moveTo(7, -4); ctx.lineTo(14, -12);
+  ctx.stroke();
+  ctx.strokeStyle = COLORS.stick;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-14, -12); ctx.lineTo(-18, 6);
+  ctx.moveTo(14, -12); ctx.lineTo(18, 6);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawCenteredText(text, y, font, color) {
+  ctx.font = font;
+  ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, G.w / 2, y);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawHUD() {
+  // Крупный счёт в правом верхнем углу
+  ctx.fillStyle = COLORS.text;
+  ctx.font = 'bold 28px "Courier New", monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'top';
+  ctx.fillText(String(G.score), G.w - BORDER_W - 14, 12 + safeTop());
+  ctx.font = '14px "Courier New", monospace';
+  ctx.fillText('Рекорд: ' + G.best, G.w - BORDER_W - 14, 46 + safeTop());
+  ctx.textAlign = 'left';
+
+  if (G.state === 'menu') {
+    drawCenteredText('СТАРТ', G.h * 0.4, 'bold 42px "Courier New", monospace', COLORS.text);
+    drawCenteredText('Стрелки / A-D, свайпы и тапы', G.h * 0.4 + 54, '16px "Courier New", monospace', COLORS.text);
+    drawCenteredText('Тапни, чтобы начать', G.h * 0.4 + 80, '16px "Courier New", monospace', COLORS.danger);
+    drawCenteredText('Придумано: Леонид Гонжал.', G.h * 0.4 + 104, '13px "Courier New", monospace', COLORS.text);
+    drawCenteredText('Реализовано: Claude AI', G.h * 0.4 + 122, '13px "Courier New", monospace', COLORS.text);
+  }
+  if (G.state === 'dead') {
+    drawCenteredText('СТОЛКНОВЕНИЕ!', G.h * 0.38, 'bold 36px "Courier New", monospace', COLORS.danger);
+    drawCenteredText('Счёт: ' + G.score, G.h * 0.38 + 46, 'bold 26px "Courier New", monospace', COLORS.text);
+    drawCenteredText('Рекорд: ' + G.best, G.h * 0.38 + 80, '18px "Courier New", monospace', COLORS.text);
+    drawCenteredText('Тапни, чтобы начать заново', G.h * 0.38 + 118, '16px "Courier New", monospace', COLORS.danger);
+  }
+}
+
+function draw() {
+  ctx.fillStyle = COLORS.sky;
+  ctx.fillRect(0, 0, G.w, G.h);
+  drawFlakes();
+  drawBorder();
+  drawBonuses();
+  drawObstacles();
+  drawPlayer();
+  drawHUD();
+}
+
+// ===================== ВВОД =====================
+// Десктоп: стрелки и A/D
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A' || e.key === 'ф' || e.key === 'Ф') { input.left = true; e.preventDefault(); }
+  if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D' || e.key === 'в' || e.key === 'В') { input.right = true; e.preventDefault(); }
+});
+window.addEventListener('keyup', (e) => {
+  if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A' || e.key === 'ф' || e.key === 'Ф') input.left = false;
+  if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D' || e.key === 'в' || e.key === 'В') input.right = false;
+});
+
+// Возврат из свёрнутого окна: keyup мог не прийти — сбрасываем флаги
+window.addEventListener('blur', () => { input.left = false; input.right = false; });
+
+// Мобильный: тап по половинам экрана (пока палец держится — движемся)
+// и свайп: горизонтальное смещение пальца конвертируется в направление.
+let touchStartX = null;
+function touchInputStart(e) {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  touchStartX = t.clientX;
+  if (t.clientX < G.w / 2) input.left = true; else input.right = true;
+}
+function touchInputMove(e) {
+  e.preventDefault();
+  if (touchStartX === null) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - touchStartX;
+  if (dx < -18) { input.left = true; input.right = false; }
+  else if (dx > 18) { input.right = true; input.left = false; }
+}
+function touchInputEnd(e) {
+  e.preventDefault();
+  touchStartX = null;
+  input.left = false;
+  input.right = false;
+}
+canvas.addEventListener('touchstart', touchInputStart, { passive: false });
+canvas.addEventListener('touchmove', touchInputMove, { passive: false });
+canvas.addEventListener('touchend', touchInputEnd, { passive: false });
+canvas.addEventListener('touchcancel', touchInputEnd, { passive: false });
+
+// Десктоп-альтернатива: удержание кнопки мыши в половине экрана
+canvas.addEventListener('mousedown', (e) => {
+  if (e.clientX < G.w / 2) input.left = true; else input.right = true;
+});
+window.addEventListener('mouseup', () => { input.left = false; input.right = false; });
+
+// Старт/рестарт: тап, клик или любая клавиша
+// Задержка после смерти 400 мс — чтобы случайный тап не рестартил мгновенно
+function handleAction() {
+  if (G.state === 'menu') { startGame(); return; }
+  if (G.state === 'dead' && performance.now() - G.deadAt > 400) startGame();
+}
+canvas.addEventListener('mousedown', handleAction);
+canvas.addEventListener('touchstart', handleAction, { passive: false });
+window.addEventListener('keydown', handleAction);
+
+// ===================== ЦИКЛ И ЗАПУСК =====================
+function loop(now) {
+  // deltaTime в секундах; clamp против скачка после сворачивания таба
+  const dt = Math.min(0.05, (now - G.lastTime) / 1000 || 0);
+  G.lastTime = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+G.best = loadBest();
+resize();
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
+G.lastTime = performance.now();
+requestAnimationFrame(loop);
+
+// Тест-хук: доступ к состоянию из Node-проверок (tests/harness.js)
+window.__skier = { G, input, loadBest, saveBest,
+  startGame, resetGame, gameOver,
+  spawnObstacle, spawnBonus, checkCollision, collectBonuses,
+  rectsOverlap,
+  updatePlayer,
+  playerHitbox, obstacleHitbox, handleAction,
+  update, draw };
+</script>
+</body>
+</html>
