@@ -41,6 +41,8 @@ const TILT_MAX = 0.22;              // наклон при повороте, р�
 const BEST_KEY = 'skier_best_v1';
 const BORDER_W = 36;           // ширина полосы ёлок-ограничителей у каждого края
 const BORDER_TREE_SPACING = 52; // вертикальный шаг ёлок в колонне
+const TRAIL_INTERVAL = 0.035;   // сек между точками следа лыжника
+const TRAIL_LIFETIME = 1.0;     // сек жизни точки следа
 
 const COLORS = {
   sky: '#dfeefb', snowDot: '#c9dcf0',
@@ -49,6 +51,7 @@ const COLORS = {
   stick: '#8d6e63', carrot: '#ff9800',
   skier: '#1565c0', skierDark: '#0d47a1', skin: '#ffcc80', ski: '#ffb300',
   bonus: '#ffd54f', bonusDark: '#ffb300',
+  trail: '#aecde6',   // след на снегу — светло-голубой
   text: '#37474f', danger: '#c62828',
 };
 
@@ -81,6 +84,7 @@ const G = {
   flakes: [],
   spawnTimer: 0, bonusTimer: 0, lastTime: 0,
   scrollY: 0,  // накопленный путь мира (для скролла колонн ограничителей)
+  trail: [], trailTimer: 0,
 };
 const input = { left: false, right: false };
 
@@ -162,6 +166,7 @@ function resetGame() {
   G.bonusTimer = 1.0;
   G.player.x = G.w / 2;
   G.player.tilt = 0;
+  G.trail.length = 0; G.trailTimer = 0;
 }
 
 function startGame() {
@@ -211,7 +216,9 @@ function collectBonuses() {
 function update(dt) {
   // Мир скроллится вверх: камера следует за спуском
   const scroll = G.state === 'playing' ? G.speed : BASE_SPEED * 0.5;
-  G.scrollY += scroll * dt; // накопление во всех состояниях
+  // Колонны ограничителей ползут в меню (живой фон) и при игре,
+  // но замирают при столкновении — мир останавливается
+  if (G.state !== 'dead') G.scrollY += scroll * dt;
   for (const f of G.flakes) {
     f.y -= scroll * f.depth * dt;
     if (f.y < -3) { f.y = G.h + 3; f.x = Math.random() * G.w; }
@@ -226,6 +233,15 @@ function update(dt) {
   G.scoreFloat += SURVIVE_SCORE_PER_SEC * dt;
   G.score = Math.floor(G.scoreFloat);
   updatePlayer(dt);
+
+  // След лыжника: точки привязаны к миру и уезжают вверх вместе с трассой
+  G.trailTimer -= dt;
+  if (G.trailTimer <= 0) {
+    G.trail.push({ x: G.player.x, y: G.player.y, born: G.elapsed });
+    G.trailTimer = TRAIL_INTERVAL;
+  }
+  for (const t of G.trail) t.y -= G.speed * dt;
+  G.trail = G.trail.filter((t) => G.elapsed - t.born < TRAIL_LIFETIME && t.y > -10);
 
   // Спавн препятствий: интервал сокращается со временем
   G.spawnTimer -= dt;
@@ -359,6 +375,17 @@ function drawBorder() {
   }
 }
 
+// След лыжника: тающие точки на снегу (стареют по игровому времени — при смерти замирают)
+function drawTrail() {
+  for (const t of G.trail) {
+    const age = G.elapsed - t.born;
+    ctx.globalAlpha = Math.max(0, 1 - age / TRAIL_LIFETIME) * 0.7;
+    ctx.fillStyle = COLORS.trail;
+    ctx.fillRect(Math.round(t.x) - 1, Math.round(t.y), 3, 3);
+  }
+  ctx.globalAlpha = 1;
+}
+
 // Лыжник, вид сверху/сзади: синяя фигурка, палки, лыжи; наклон при повороте
 function drawPlayer() {
   const p = G.player;
@@ -434,6 +461,7 @@ function draw() {
   ctx.fillRect(0, 0, G.w, G.h);
   drawFlakes();
   drawBorder();
+  drawTrail();
   drawBonuses();
   drawObstacles();
   drawPlayer();
