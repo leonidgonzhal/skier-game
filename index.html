@@ -43,6 +43,7 @@ const BORDER_W = 36;           // ширина полосы ёлок-огран�
 const BORDER_TREE_SPACING = 52; // вертикальный шаг ёлок в колонне
 const TRAIL_INTERVAL = 0.035;   // сек между точками следа лыжника
 const TRAIL_LIFETIME = 1.0;     // сек жизни точки следа
+const SKI_OFFSET = 7;           // смещение лыжни от центра лыжника (центры лыж в спрайте)
 
 const COLORS = {
   sky: '#dfeefb', snowDot: '#c9dcf0',
@@ -237,7 +238,11 @@ function update(dt) {
   // След лыжника: точки привязаны к миру и уезжают вверх вместе с трассой
   G.trailTimer -= dt;
   if (G.trailTimer <= 0) {
-    G.trail.push({ x: G.player.x, y: G.player.y, born: G.elapsed });
+    // Две лыжни: точки обеих лыж (смещение поворачивается вместе с наклоном)
+    const ox = SKI_OFFSET * Math.cos(G.player.tilt);
+    const oy = SKI_OFFSET * Math.sin(G.player.tilt);
+    G.trail.push({ x: G.player.x - ox, y: G.player.y - oy, born: G.elapsed });
+    G.trail.push({ x: G.player.x + ox, y: G.player.y + oy, born: G.elapsed });
     G.trailTimer = TRAIL_INTERVAL;
   }
   for (const t of G.trail) t.y -= G.speed * dt;
